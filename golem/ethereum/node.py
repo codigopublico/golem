@@ -1,4 +1,6 @@
 import atexit
+import shutil
+
 from devp2p.crypto import privtopub
 from ethereum.keys import privtoaddr
 from ethereum.transactions import Transaction
@@ -24,6 +26,22 @@ from golem.utils import find_free_net_port
 from golem.utils import tee_target
 
 log = logging.getLogger('golem.ethereum')
+
+
+GENESES = {
+    '0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3':
+        'mainnet',  # noqa
+    '0x41941023680923e0fe4d74a34bdac8141f2540e3ae90623718e47d66d1ca4a2d':
+        'ropsten',  # noqa
+    '0x6341fd3daf94b748c72ced5a5b26028f2474f5f00d824504e4fa37a75767e177':
+        'rinkeby',  # noqa
+}
+
+BLOCK_HASHES = {
+    'rinkeby': {
+        1035301: ''
+    }
+}
 
 
 def tETH_faucet_donate(addr):
@@ -64,7 +82,7 @@ class Faucet(object):
 
 
 class NodeProcess(object):
-    MIN_GETH_VERSION = '1.6.1'
+    MIN_GETH_VERSION = '1.7.2'
     MAX_GETH_VERSION = '1.7.999'
     IPC_CONNECTION_TIMEOUT = 10
 
@@ -101,37 +119,18 @@ class NodeProcess(object):
         return self.__ps is not None
 
     @report_calls(Component.ethereum, 'node.start')
-    def start(self, port=None):
+    def start(self, port=None, init_chain=True):
         if self.__ps is not None:
             raise RuntimeError("Ethereum node already started by us")
 
-        if is_frozen():
-            pipes = self.SUBPROCESS_PIPES
-            this_dir = os.path.join(os.path.dirname(sys.executable),
-                                    'golem', 'ethereum')
-        else:
-            pipes = dict()
-            this_dir = os.path.dirname(__file__)
-
         # Init geth datadir
         chain = 'rinkeby'
-        init_file = os.path.join(this_dir, chain + '.json')
-        log.info("init file: {}".format(init_file))
         geth_log_dir = os.path.join(self.datadir, "logs")
-        if not os.path.exists(geth_log_dir):
-            os.makedirs(geth_log_dir)
         geth_log_path = os.path.join(geth_log_dir, "geth.log")
         geth_datadir = os.path.join(self.datadir, 'ethereum', chain)
-        datadir_arg = '--datadir={}'.format(geth_datadir)
-        genesis_args = [self.__prog, datadir_arg,
-                        'init', init_file]
-        init_subp = subprocess.Popen(genesis_args, **pipes)
-        init_subp.wait()
-        if init_subp.returncode != 0:
-            error_msg = "geth init failed with code {}".format(
-                init_subp.returncode)
-            log.error(error_msg)
-            raise OSError(error_msg)
+
+        os.makedirs(geth_log_dir, exist_ok=True)
+        os.makedirs(geth_datadir, exist_ok=True)
 
         if port is None:
             port = find_free_net_port()
@@ -142,31 +141,34 @@ class NodeProcess(object):
         ipc_file = '{}-{}'.format(chain, port)
         ipc_path = os.path.join(tempdir, ipc_file)
 
-        args = [
+        common_args = [
             self.__prog,
-            datadir_arg,
-            '--cache=32',
-            '--syncmode=light',
             '--rinkeby',
+            '--syncmode=light',
+            '--datadir={}'.format(geth_datadir),
+        ]
+
+        args = common_args + [
             '--port={}'.format(port),
             '--ipcpath={}'.format(ipc_path),
             '--nousb',
             '--verbosity', '3',
         ]
 
-        log.info("Starting Ethereum node: `{}`".format(" ".join(args)))
-        self.__ps = subprocess.Popen(args, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE,
-                                     stdin=DEVNULL)
+        if init_chain:
+            self._init_chain(common_args, chain)
 
-        tee_kwargs = {
-            'prefix': 'geth: ',
-            'proc': self.__ps,
-            'path': geth_log_path,
-        }
-        tee_thread = threading.Thread(name='geth-tee', target=tee_target,
-                                      kwargs=tee_kwargs)
-        tee_thread.start()
+        log.info("Starting Ethereum node: `{}`".format(" ".join(args)))
+        self.__ps = subprocess.Popen(args, **self.SUBPROCESS_PIPES)
+
+        # tee_kwargs = {
+        #     'prefix': 'geth: ',
+        #     'proc': self.__ps,
+        #     'path': geth_log_path,
+        # }
+        # tee_thread = threading.Thread(name='geth-tee', target=tee_target,
+        #                               kwargs=tee_kwargs)
+        # tee_thread.start()
 
         atexit.register(lambda: self.stop())
 
@@ -183,9 +185,14 @@ class NodeProcess(object):
             time.sleep(CHECK_PERIOD)
             wait_time += CHECK_PERIOD
 
-        identified_chain = self.identify_chain()
+        identified_chain = self._identify_chain()
         if identified_chain != chain:
             raise OSError("Wrong '{}' Ethereum chain".format(identified_chain))
+
+        if not self._validate_chain(chain):
+            self.stop()
+            self._remove_chain(geth_datadir)
+            return self.start()
 
         log.info("Node started in %ss: `%s`", wait_time, " ".join(args))
 
@@ -197,25 +204,88 @@ class NodeProcess(object):
             try:
                 self.__ps.terminate()
                 self.__ps.wait()
-            except subprocess.NoSuchProcess:
-                log.warn("Cannot terminate node: process {} no longer exists"
-                         .format(self.__ps.pid))
+            except subprocess.CompletedProcess:
+                log.warning("Cannot terminate node: process {} no longer exists"
+                            .format(self.__ps.pid))
 
             self.__ps = None
             duration = time.clock() - start_time
             log.info("Node terminated in {:.2f} s".format(duration))
 
-    def identify_chain(self):
+    def _init_chain(self, common_args, chain):
+        if is_frozen():
+            pipes = self.SUBPROCESS_PIPES
+            this_dir = os.path.join(os.path.dirname(sys.executable),
+                                    'golem', 'ethereum')
+        else:
+            pipes = dict()
+            this_dir = os.path.dirname(__file__)
+
+        init_file = os.path.join(this_dir, chain + '.json')
+        log.info("init file: {}".format(init_file))
+
+        args = common_args + [
+            'init',
+            init_file
+        ]
+
+        process = subprocess.Popen(args, **pipes)
+        process.wait()
+
+        if process.returncode != 0:
+            error = "geth init failed with code {}".format(process.returncode)
+            log.error(error)
+            raise OSError(error)
+
+    @staticmethod
+    def _remove_chain(geth_datadir):
+        """Remove current chain data"""
+        log.info("Removing geth's chain database")
+
+        chaindata = os.path.join(geth_datadir, 'geth', 'chaindata')
+        lightchaindata = os.path.join(geth_datadir, 'geth', 'lightchaindata')
+
+        for directory in [chaindata, lightchaindata]:
+            if os.path.exists(directory):
+                shutil.rmtree(directory)
+
+        log.info("Geth's chain database removed")
+
+    def _identify_chain(self):
         """Check what chain the Ethereum node is running."""
-        GENESES = {
-        '0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3':
-            'mainnet',  # noqa
-        '0x41941023680923e0fe4d74a34bdac8141f2540e3ae90623718e47d66d1ca4a2d':
-            'ropsten',  # noqa
-        '0x6341fd3daf94b748c72ced5a5b26028f2474f5f00d824504e4fa37a75767e177':
-            'rinkeby',  # noqa
-        }
         genesis = self.web3.eth.getBlock(0)['hash']
         chain = GENESES.get(genesis, 'unknown')
         log.info("{} chain ({})".format(chain, genesis))
         return chain
+
+    def _validate_chain(self, chain):
+        blocks = BLOCK_HASHES.get(chain)
+        if not blocks:
+            return True
+
+        for block_num, block_hash in blocks.items():
+
+            try:
+                block = self.web3.eth.getBlock(block_num)
+            except ValueError as err:
+                message = self._parse_web3_error_message(err).lower()
+
+                if message == 'no trusted canonical hash trie':
+                    log.warning('Block not downloaded: %s', block_num)
+                elif message == 'no suitable peers available':
+                    log.warning('Malformed chain: %s', message)
+                    return False
+
+            if block and block_hash != block['hash']:
+                log.warning('Invalid hash of block {}: {}, expected {}'
+                            .format(block_num, block['hash'], block_hash))
+                return False
+
+        return True
+
+    @staticmethod
+    def _parse_web3_error_message(err: ValueError):
+        if not err or not err.args or not isinstance(err.args[0], dict):
+            return
+        return err.args[0].get('message')
+
